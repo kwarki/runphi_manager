@@ -49,7 +49,7 @@ Dettaglio dei Task
 
         (Opzionale) Supporto alla configurazione per memguard per il throttling della banda di memoria.
 
-3. Carmy — Storage, LVM & Network Devices
+3. Carmine — Storage, LVM & Network Devices
 
     disk.rs:
 
@@ -72,3 +72,23 @@ Perché questa suddivisione è bilanciata
     Dipendenze minime: I parametri kernel (isolcpu/nohz_full) vanno a braccetto con boot.rs, mentre cpu.rs condivide naturalmente la logica di pinning e IRQ steering.
 
     Isolamento della memoria: mem.rs è più compatto a livello di argomenti QEMU diretti, ma viene bilanciato dalla gestione dei cgroups e del memory locking.
+
+
+# **BUG (?)**:
+
+When a guest executes `poweroff` or receives a `docker stop`, Docker triggers an OCI delete.
+
+Currently, runPHI also deletes the container's state directory (/run/runPHI/<id>).
+
+Because the directory was prematurely destroyed, running `docker start` on the old container, runPHI's forwarding logic can no longer recognize the container, hence the forwarding to runc vanilla:
+`Error: Failed to exec /usr/local/sbin/runc_vanilla: No such file or directory (os error 2)`
+
+According to oci standard, `docker start` results in oci commands `delete` -> `create` -> `start`.
+
+The forwarding decision checks that /run/runPHI/<id> is present.
+
+## FIX
+
+`docker stop` should just remove the content of `/run/runPHI/<id>/*`, but not delete the directory itself, in this way runphi can remember that he is the one handling the container.
+
+Only `docker rm` should result in the removal of the state directory.

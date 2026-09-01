@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub mod cpu;
 pub mod boot;
+pub mod disk;
 
 // NOTE(lorenzo): Minimal structure to organize QEMU flags and args
 #[derive(Debug, Default)]
@@ -31,11 +32,12 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
     let mut c = BackendConfig::new();
     c.args_file = fc.crundir.join("qemu.args");
 
-    let mut config = Box::new(f2b::ImageConfig::get_from_file(&fc.mountpoint)?);
+    let config = Box::new(f2b::ImageConfig::get_from_file(&fc.mountpoint)?);
     let is_linux = config.os_var.eq_ignore_ascii_case("linux");
 
     let _ = cpu::cpuconf(&fc,&config, &mut c);
     let _ = boot::bootconf(&config, &mut c, &is_linux);
+    let _ = disk::diskconf(fc, &mut c, &config);
 
     //c.add_arg("-display", "none");
     //c.add_arg("-monitor", "none");
@@ -50,9 +52,9 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
 
     c.add_arg("-D", format!("{}", debug_file.display()));
     c.add_flag("-S"); 
-    
-    let console_file = fc.crundir.join("console.log");
-    //c.add_arg("-serial", format!("file:{}", console_file.display()));
+
+    // let console_file = fc.crundir.join("console.log");
+    // c.add_arg("-serial", format!("file:{}", console_file.display()));
     c.add_arg("-serial", "stdio");
 
 
@@ -72,8 +74,6 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
     // 5. Configurazione Socket QMP
     let qmp_socket = fc.crundir.join(format!("{}-qmp.sock", fc.containerid));
     c.add_arg("-qmp", format!("unix:{},server,nowait", qmp_socket.display()));
-
-    
 
     // 7. Scrittura su disco: un argomento per riga
     let file_content = c.args.join("\n");

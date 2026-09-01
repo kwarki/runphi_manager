@@ -19,10 +19,17 @@ pub fn bootconf(
         if !ic.dtb.is_empty() {
             c.add_arg("-dtb", &ic.dtb);
         }
-        c.add_arg("-append", "console=ttyS0,115200");
+
+        if matches!(ic.disk_type.as_str(), "file" | "lvm") {
+            c.add_arg("-append", "console=ttyS0,115200 root=/dev/vda rw");
+        } else {
+            c.add_arg("-append", "console=ttyS0,115200");
+        }
+
+        // c.add_arg("-append", "console=ttyS0,115200");
     } else {
         c.add_arg("-kernel", &ic.inmate);
     }
-    
+ 
     Ok(())
 }

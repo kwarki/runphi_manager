@@ -6,30 +6,37 @@ use f2b;
 pub fn bootconf(
     ic: &f2b::ImageConfig,
     c: &mut configGenerator::BackendConfig,
-    is_linux: &bool
+    is_linux: &bool,
 ) -> Result<(), Box<dyn Error>> {
+    let mut os_boot = String::new();
 
     if *is_linux {
         if !ic.inmate.is_empty() {
-            c.add_arg("-kernel", &ic.inmate);
+            os_boot.push_str(&format!("    <kernel>{}</kernel>\n", ic.inmate));
         }
         if !ic.ramdisk.is_empty() {
-            c.add_arg("-initrd", &ic.ramdisk);
+            os_boot.push_str(&format!("    <initrd>{}</initrd>\n", ic.ramdisk));
         }
         if !ic.dtb.is_empty() {
-            c.add_arg("-dtb", &ic.dtb);
+            os_boot.push_str(&format!("    <dtb>{}</dtb>\n", ic.dtb));
         }
 
-        if matches!(ic.disk_type.as_str(), "file" | "lvm") {
-            c.add_arg("-append", "console=ttyS0,115200 root=/dev/vda rw");
+        // Costruzione della cmdline per Linux
+        let cmdline = if matches!(ic.disk_type.as_str(), "file" | "lvm") {
+            "console=ttyS0,115200 root=/dev/vda rw"
         } else {
-            c.add_arg("-append", "console=ttyS0,115200");
-        }
+            "console=ttyS0,115200"
+        };
 
-        // c.add_arg("-append", "console=ttyS0,115200");
+        os_boot.push_str(&format!("    <cmdline>{}</cmdline>", cmdline));
     } else {
-        c.add_arg("-kernel", &ic.inmate);
+        // Payload Bare-Metal (Zephyr, unikernel, raw ELF)
+        if !ic.inmate.is_empty() {
+            os_boot.push_str(&format!("    <kernel>{}</kernel>", ic.inmate));
+        }
     }
- 
+
+    c.os_boot_xml = os_boot;
+
     Ok(())
 }

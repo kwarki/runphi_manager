@@ -18,6 +18,7 @@ use std::io::Write;
 #[allow(non_snake_case)]
 pub mod configGenerator;
 pub mod timer;
+pub mod cgroups;
 
 // Struttura per mappare esattamente i campi che ci interessano dall'output di QEMU
 #[derive(Deserialize, Debug)]
@@ -206,6 +207,14 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
         .spawn()?;
 
     std::fs::write(&fc.pidfile, format!("{}", qemu_child.id()))?;
+
+    // Attach QEMU process to cgroups and apply OCI resource restrictions
+    if let Err(e) = cgroups::setup_cgroups(fc, ic, qemu_child.id()) {
+        logging::log_message(
+            logging::Level::Warn,
+            &format!("Failed to setup cgroups for container {}: {}", fc.containerid, e),
+        );
+    }
 
     if ic.vcpu_pinning.len() == 0 {
         return Ok(());
@@ -420,6 +429,14 @@ pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Err
                 ),
             }
         }
+    }
+
+    // Clean up cgroups
+    if let Err(e) = cgroups::destroy_cgroups(containerid, crundir) {
+        logging::log_message(
+            logging::Level::Warn,
+            &format!("Failed to clean up cgroups for container {}: {}", containerid, e),
+        );
     }
 
     fs::remove_dir_all(crundir).ok();

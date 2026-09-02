@@ -1,23 +1,13 @@
-use nix::libc::PR_ENDIAN_BIG;
-use nix::sched::{sched_setaffinity, CpuSet};
-use nix::unistd::Pid;
-use serde::Deserialize;
-use serde_json::Value;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::str;
-// use std::os::unix::net::UnixStream;
 
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-
-use std::io::Write;
-// use std::io::Read;
 
 #[allow(non_snake_case)]
 pub mod configGenerator;
+pub mod irq;
 pub mod timer;
 
 // Run an external command and return Err if it can't be spawned or
@@ -177,6 +167,13 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
     let watcher_pid = watcher.id().to_string();
     fs::write(&fc.pidfile, watcher_pid)?;
 
+    // NOTE(lorenzo): Apply IRQ steering if specified
+    if let Some(cpus) = irq::get_steer_irqs(fc, ic) {
+        irq::apply_irq_steering(&fc.crundir, ic, &cpus)?;
+    }
+
+    
+
     Ok(())
 }
 
@@ -222,6 +219,14 @@ pub fn stopguest(containerid: &str, _crundir: &Path) -> Result<(), Box<dyn Error
 
 pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Error>> {
     let domain_name = format!("runphi-{}", containerid);
+
+    // NOTE: Restore original IRQ affinities if they were steered
+    if let Err(e) = irq::restore_irq_steering(crundir) {
+        logging::log_message(
+            logging::Level::Warn,
+            &format!("Fallito ripristino affinità IRQ per '{}': {}", domain_name, e),
+        );
+    }
 
     let output = Command::new("virsh")
         .arg("destroy")

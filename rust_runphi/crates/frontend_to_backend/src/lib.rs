@@ -145,9 +145,8 @@ pub struct ImageConfig {
     pub nohz_full: String,
 
     // NOTE(lorenzo): Map specifying where redirect IRQs
-    #[serde(default)]
-    pub irq_steering: Option<Vec<usize>>,
-
+    #[serde(default, alias = "irq_steering")]
+    pub steer_irq: Option<Vec<usize>>,
 }
 impl ImageConfig {
     fn resolve_rootfs_path(mountpoint: &Path, path: &str) -> String {

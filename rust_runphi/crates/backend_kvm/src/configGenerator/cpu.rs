@@ -94,6 +94,12 @@ pub fn cpuconf(
         cputune.push_str("  </cputune>");
         c.cputune_xml = cputune;
     }
+    
+    
+    // Validate IRQ steering target CPUs and warn if any are isolated
+    if let Some(cpus) = crate::irq::get_steer_irqs(fc, ic) {
+        crate::irq::warn_if_isolated(&cpus, ic);
+    }
 
     Ok(())
 }

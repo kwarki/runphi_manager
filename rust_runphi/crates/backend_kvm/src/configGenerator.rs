@@ -110,8 +110,9 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
     // 2. Popolamento sezioni da sottomoduli
     cpu::cpuconf(fc, &config, &mut c)?;
     boot::bootconf(&config, &mut c, &is_linux)?;
+    disk::diskconf(fc, &mut c, &config)?;
     network::netconf(fc, &config, &mut c)?;
-    
+
     let serial_xml = r#"<serial type='pty'>
       <target type='isa-serial' port='0'/>
     </serial>"#.to_string();

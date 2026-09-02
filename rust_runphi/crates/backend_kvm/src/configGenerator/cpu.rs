@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::path::Path;
+#[cfg(target_arch = "aarch64")]
 use std::env;
 
 use crate::configGenerator;

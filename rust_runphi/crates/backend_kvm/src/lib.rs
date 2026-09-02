@@ -106,7 +106,7 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
     let domain_xml = fc.crundir.join("domain.xml");
     let domain_name = format!("runphi-{}", fc.containerid);
 
-    // // 1. Provisioning del disco LVM (se configurato dal task di storage)
+    // NOTE(lorenzo): Provision disk if asked
     // let diskstate = fc.crundir.join("disk");
     // if diskstate.exists() {
     //     let state = fs::read_to_string(&diskstate)?;
@@ -116,16 +116,7 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
     //     provision_lvm_root(lv, size_mb, &fc.mountpoint, &fc.crundir)?;
     // }
 
-    // // 2. Applicazione IRQ Steering sull'host (se specificato)
-    // if !ic.isolcpu.is_empty() {
-    //     if let Err(e) = isolation::apply_irq_steering(&ic.isolcpu) {
-    //         eprintln!("Warning: impossibile applicare IRQ steering: {}", e);
-    //     }
-    // }
 
-    // 3. Creazione e avvio del dominio Libvirt in stato di PAUSA (--paused)
-    // 'virsh create' crea un dominio transitorio (non persistente, perfetto per i container)
-    // '--paused' blocca la VM prima dell'avvio del payload, conforme alla semantica OCI 'create'
     let create_output = Command::new("virsh")
         .arg("create")
         .arg(&domain_xml)
@@ -252,7 +243,7 @@ pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Err
         }
     }
 
-    // // 2. Teardown dello storage LVM (se allocato per il container)
+    // NOTE(lorenzo): teardown disk if was present
     // let diskstate = crundir.join("disk");
     // if let Ok(state) = fs::read_to_string(&diskstate) {
     //     if let Some(lv) = state.split_whitespace().next() {
@@ -268,7 +259,6 @@ pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Err
     //     }
     // }
 
-    // 3. Rimozione della working directory OCI
     fs::remove_dir_all(crundir).ok();
 
     Ok(())

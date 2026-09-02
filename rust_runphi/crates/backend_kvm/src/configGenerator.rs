@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub mod boot;
 pub mod cpu;
 pub mod disk;
+pub mod network;
 
 #[derive(Debug, Default)]
 pub struct BackendConfig {
@@ -81,7 +82,16 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
     c.name = format!("runphi-{}", fc.containerid);
     c.xml_file = fc.crundir.join("domain.xml");
 
-    let config = Box::new(f2b::ImageConfig::get_from_file(&fc.mountpoint)?);
+    let config = match f2b::ImageConfig::get_from_file(&fc.mountpoint) {
+        Ok(cfg) => Box::new(cfg),
+        Err(e) => {
+            logging::log_message(
+                logging::Level::Error,
+                &format!("Failed to read boot config from {}: {}", fc.mountpoint.display(), e),
+            );
+            return Err(e);
+        }
+    };
     let is_linux = config.os_var.eq_ignore_ascii_case("linux");
 
     // 1. Calcolo Memoria RAM (convertita in KiB per Libvirt)
@@ -101,6 +111,7 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
     cpu::cpuconf(fc, &config, &mut c)?;
     boot::bootconf(&config, &mut c, &is_linux)?;
     disk::diskconf(fc, &mut c, &config)?;
+    network::netconf(fc, &config, &mut c)?;
 
     let serial_xml = r#"<serial type='pty'>
       <target type='isa-serial' port='0'/>

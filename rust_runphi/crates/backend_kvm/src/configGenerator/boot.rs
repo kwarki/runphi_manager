@@ -21,7 +21,6 @@ pub fn bootconf(
             os_boot.push_str(&format!("    <dtb>{}</dtb>\n", ic.dtb));
         }
 
-        // Costruzione della cmdline per Linux
         let cmdline = if matches!(ic.disk_type.as_str(), "file" | "lvm") {
             "console=ttyS0,115200 root=/dev/vda rw"
         } else {

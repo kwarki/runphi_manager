@@ -1,3 +1,4 @@
+use nix::libc::PR_ENDIAN_BIG;
 use nix::sched::{sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
 use serde::Deserialize;
@@ -139,8 +140,7 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
 
     let mut qemu_pid = String::new();
 
-    // Ricerca più robusta: cerchiamo "qemu-system" seguito dal nome del dominio.
-    // Usiamo una regex di base per evitare di matchare processi spazzatura.
+    
     let search_pattern = format!("qemu-system.*{}", domain_name);
 
     let pgrep_out = Command::new("pgrep")
@@ -161,40 +161,17 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
             &format!("PID trovato tramite pgrep: {}", qemu_pid),
         );
     } else {
-        logging::log_message(
-            logging::Level::Info,
-            "pgrep fallito. Avvio della diagnostica...",
-        );
+        let stderr = String::from_utf8_lossy(&pgrep_out.stderr);
+        logging::log_message(logging::Level::Info, &format!("Fallito pgrep: {}", stderr));
+        return Err("pgrep failed".into());
+    } 
 
-        // 1. Controlliamo se libvirt vede la VM in esecuzione o se è andata in shut off
-        let virsh_list = Command::new("virsh")
-            .args(&["-c", "qemu:///system", "list", "--all"])
-            .output()
-            .unwrap();
-        logging::log_message(
-            logging::Level::Info,
-            &format!(
-                "Stato dei domini in libvirt:\n{}",
-                String::from_utf8_lossy(&virsh_list.stdout)
-            ),
-        );
-
-        // 2. Controlliamo la lista completa dei processi QEMU effettivamente attivi sull'host
-        let ps_out = Command::new("sh")
-            .arg("-c")
-            .arg("ps aux | grep qemu")
-            .output()
-            .unwrap();
-        logging::log_message(
-            logging::Level::Info,
-            &format!(
-                "Processi QEMU rilevati dal kernel:\n{}",
-                String::from_utf8_lossy(&ps_out.stdout)
-            ),
-        );
-    }
-    // Avviamo un piccolo processo guardiano (figlio diretto del runtime/containerd-shim)
-    // che monitora il PID di QEMU e termina non appena QEMU muore.
+    // NOTE(lorenzo): Start a small program which sees if qemu is killed. That is because 
+    //                the real parent of qemu is libvirtd, not virsh. So when containerd tries to kill
+    //                the PID written in the pidfile, the signal is sent to libvirtd, not containerd.
+    //                containerd never knows if qemu got killed or no, so it leaves its state "Up"
+    //                By using a watcher program, which dies if qemu is killed by a virsh destroy,
+    //                containerd receives correctly the signal when the watcher dies. 
     let watcher = Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -206,7 +183,6 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
         .stderr(Stdio::null())
         .spawn()?;
 
-    // Scriviamo nel pidfile il PID del GUARDIA (figlio diretto), NON quello di QEMU
     let watcher_pid = watcher.id().to_string();
     fs::write(&fc.pidfile, watcher_pid)?;
 
@@ -216,8 +192,6 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
 pub fn startguest(containerid: &str, _crundir: &Path) -> Result<(), Box<dyn Error>> {
     let domain_name = format!("runphi-{}", containerid);
 
-    // 'virsh resume' sblocca la VM creata precedentemente in pausa con '--paused',
-    // facendo partire l'esecuzione del payload (Linux o bare-metal/Zephyr).
     let output = Command::new("virsh")
         .arg("resume")
         .arg(&domain_name)
@@ -238,7 +212,6 @@ pub fn startguest(containerid: &str, _crundir: &Path) -> Result<(), Box<dyn Erro
 pub fn stopguest(containerid: &str, _crundir: &Path) -> Result<(), Box<dyn Error>> {
     let domain_name = format!("runphi-{}", containerid);
 
-    // 'virsh suspend' congela l'esecuzione delle vCPU (equivalente 1:1 al comando QMP 'stop').
     let output = Command::new("virsh")
         .arg("suspend")
         .arg(&domain_name)
@@ -259,7 +232,6 @@ pub fn stopguest(containerid: &str, _crundir: &Path) -> Result<(), Box<dyn Error
 pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Error>> {
     let domain_name = format!("runphi-{}", containerid);
 
-    // 1. Terminazione forzata del processo VM tramite virsh
     let output = Command::new("virsh")
         .arg("destroy")
         .arg(&domain_name)
@@ -267,7 +239,7 @@ pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Err
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignoriamo il warning se il guest era già terminato spontaneamente (es. poweroff di Zephyr o Linux)
+        // NOTE(lorenzo): Ignore the warning if the guest was already down (ex. poweroff)
         if !stderr.contains("domain is not running") && !stderr.contains("Domain not found") {
             logging::log_message(
                 logging::Level::Warn,

@@ -12,7 +12,6 @@ pub fn cpuconf(
 ) -> Result<(), Box<dyn Error>> {
     let has_kvm = Path::new("/dev/kvm").exists();
 
-    // 1. Configurazione Architettura, Macchina, Features e CPU Model
     #[cfg(target_arch = "aarch64")]
     {
         let host_arch = env::consts::ARCH;
@@ -44,7 +43,6 @@ pub fn cpuconf(
         }
     }
 
-    // 2. Calcolo Quota OCI e Allocazione vCPU
     let period = fc.jsonconfig["linux"]["resources"]["cpu"]["period"]
         .as_f64()
         .unwrap_or(0.0);
@@ -81,10 +79,10 @@ pub fn cpuconf(
         );
     }
 
-    // Imposta il numero di vCPU per il tag <vcpu>
+    
     c.vcpus = allocated_vcpus;
 
-    // 3. Generazione dichiarativa del tag <cputune> per il Pinning
+    // NOTE(lorenzo): Set the define vCPU pinning, if present
     if !ic.vcpu_pinning.is_empty() {
         let mut cputune = String::from("<cputune>\n");
         for pin in &ic.vcpu_pinning {

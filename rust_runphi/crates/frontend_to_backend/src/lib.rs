@@ -54,6 +54,33 @@ pub struct VcpuPin {
     pub pcpu: usize,
 }
 
+/// NOTE(lorenzo): Custom deserializer for `net` in `ImageConfig`.
+/// Accepts either a boolean (`true`/`false`) or a string (e.g. `"yes"`, `"no"`, `"docker0"`),
+/// normalizing `true` -> `"yes"` and `false` -> `"no"`. This prevents serde deserialization
+/// failures when users write `"net": true/false` as boolean literals in `/boot/config.json`.
+fn deserialize_net<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NetVisitor;
+    impl<'de> serde::de::Visitor<'de> for NetVisitor {
+        type Value = String;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or boolean")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(if v { "yes".to_string() } else { "no".to_string() })
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_any(NetVisitor)
+}
+
 // This structure holds the information that describe the image to be started as partitioned cell
 // These are additional to standard information required by containers. For example, if dealing with a
 // binary, the starting virtual address is required to perform a mapping, or the devices used or the
@@ -120,7 +147,7 @@ pub struct ImageConfig {
     #[serde(default)]
     pub memory: u64,
     // This lines are needed to include the "net" and "rpu_req" field
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_net")]
     pub net: String,
     #[serde(default)]
     pub rpu_req: bool,

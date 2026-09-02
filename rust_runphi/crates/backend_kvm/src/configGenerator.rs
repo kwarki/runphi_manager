@@ -2,63 +2,89 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-pub mod cpu;
 pub mod boot;
+pub mod cpu;
 pub mod disk;
 
-// NOTE(lorenzo): Minimal structure to organize QEMU flags and args
 #[derive(Debug, Default)]
 pub struct BackendConfig {
-    pub args: Vec<String>,
-    pub args_file: PathBuf,
+    pub domain_type: String,      // "kvm" oppure "qemu"
+    pub name: String,             // Nome del container/dominio
+    pub memory_kib: u64,          // Memoria RAM in KiB
+    pub vcpus: u32,               // Numero di vCPU
+    pub cputune_xml: String,      // Tag <cputune> con i mapping <vcpupin>
+    pub cpu_xml: String,          // Tag <cpu mode='...'>
+    pub os_arch: String,          // "x86_64" o "aarch64"
+    pub os_machine: String,       // "q35" o "virt"
+    pub os_boot_xml: String,      // <kernel>, <initrd>, <cmdline>, <dtb>
+    pub features_xml: String,     // <acpi/>, <apic/>, <gic/>
+    pub devices_xml: Vec<String>, // Dischi, interfacce di rete, seriali
+    pub xml_file: PathBuf,        // Percorso di destinazione (es. domain.xml)
 }
 
 impl BackendConfig {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            domain_type: "kvm".to_string(),
+            os_arch: std::env::consts::ARCH.to_string(),
+            ..Default::default()
+        }
     }
 
-    pub fn add_arg<S: Into<String>>(&mut self, flag: &str, val: S) {
-        self.args.push(flag.to_string());
-        self.args.push(val.into());
-    }
+    /// Assembla tutti i blocchi parziali in un documento Domain XML valido per virsh
+    pub fn to_xml(&self) -> String {
+        let devices = self.devices_xml.join("\n    ");
 
-    pub fn add_flag(&mut self, flag: &str) {
-        self.args.push(flag.to_string());
+        format!(
+            r#"<domain type='{}'>
+  <name>{}</name>
+  <memory unit='KiB'>{}</memory>
+  <vcpu placement='static'>{}</vcpu>
+  {}
+  <os>
+    <type arch='{}' machine='{}'>hvm</type>
+    {}
+  </os>
+  <features>
+    {}
+  </features>
+  {}
+  <seclabel type='static' model='dac' relabel='no'>
+    <label>root:root</label>
+  </seclabel>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>destroy</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-{}</emulator>
+    {}
+  </devices>
+</domain>"#,
+            self.domain_type,
+            self.name,
+            self.memory_kib,
+            self.vcpus,
+            self.cputune_xml,
+            self.os_arch,
+            self.os_machine,
+            self.os_boot_xml,
+            self.features_xml,
+            self.cpu_xml,
+            self.os_arch,
+            devices
+        )
     }
 }
 
 pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>, Box<dyn Error>> {
     let mut c = BackendConfig::new();
-    c.args_file = fc.crundir.join("qemu.args");
+    c.name = format!("runphi-{}", fc.containerid);
+    c.xml_file = fc.crundir.join("domain.xml");
 
     let config = Box::new(f2b::ImageConfig::get_from_file(&fc.mountpoint)?);
     let is_linux = config.os_var.eq_ignore_ascii_case("linux");
 
-    let _ = cpu::cpuconf(&fc,&config, &mut c);
-    let _ = boot::bootconf(&config, &mut c, &is_linux);
-    let _ = disk::diskconf(fc, &mut c, &config);
-
-    //c.add_arg("-display", "none");
-    //c.add_arg("-monitor", "none");
-    c.add_flag("-nographic");
-    c.add_flag("-no-reboot");
-    c.add_arg("-d", "int,guest_errors");
-    
-    let debug_file = fc.crundir.join("qemu-cpu-debug.log");
-
-    let console_sock = fc.crundir.join("console.sock");
-    c.add_arg("-serial", format!("unix:{},server,nowait", console_sock.display()));
-
-    c.add_arg("-D", format!("{}", debug_file.display()));
-    c.add_flag("-S"); 
-
-    // let console_file = fc.crundir.join("console.log");
-    // c.add_arg("-serial", format!("file:{}", console_file.display()));
-    c.add_arg("-serial", "stdio");
-
-
-    // 4. Calcolo Memoria RAM (MB)
+    // 1. Calcolo Memoria RAM (convertita in KiB per Libvirt)
     let default_mb: u64 = if is_linux { 1024 } else { 32 };
     let mem_mb = if config.memory > 0 {
         config.memory
@@ -69,14 +95,27 @@ pub fn config_generate(fc: &f2b::FrontendConfig) -> Result<Box<f2b::ImageConfig>
             .filter(|&mb| mb > 0)
             .unwrap_or(default_mb)
     };
-    c.add_arg("-m", format!("{}M", mem_mb));
+    c.memory_kib = mem_mb * 1024;
 
-    // 5. Configurazione Socket QMP
-    let qmp_socket = fc.crundir.join(format!("{}-qmp.sock", fc.containerid));
-    c.add_arg("-qmp", format!("unix:{},server,nowait", qmp_socket.display()));
+    // 2. Popolamento sezioni da sottomoduli
+    cpu::cpuconf(fc, &config, &mut c)?;
+    boot::bootconf(&config, &mut c, &is_linux)?;
+    
+    let serial_xml = r#"<serial type='pty'>
+      <target type='isa-serial' port='0'/>
+    </serial>"#.to_string();
+    c.devices_xml.push(serial_xml);
 
-    // 7. Scrittura su disco: un argomento per riga
-    let file_content = c.args.join("\n");
-    fs::write(&c.args_file, file_content)?;
+    // Console primaria agganciata al PTY
+    let console_xml = r#"<console type='pty'>
+      <target type='serial' port='0'/>
+    </console>"#.to_string();
+    c.devices_xml.push(console_xml);
+
+
+    // 4. Scrittura del file XML finale su disco
+    let xml_content = c.to_xml();
+
+    fs::write(&c.xml_file, xml_content)?;
     Ok(config)
 }

@@ -9,6 +9,7 @@ use std::str;
 pub mod configGenerator;
 pub mod irq;
 pub mod timer;
+pub mod cgroups;
 
 // Run an external command and return Err if it can't be spawned or
 // exits non-zero. Replaces the .output().expect("Failed to execute
@@ -81,6 +82,20 @@ pub fn createguest(fc: &f2b::FrontendConfig, ic: &f2b::ImageConfig) -> Result<()
         logging::Level::Info,
         &format!("PID trovato tramite pgrep: {}", qemu_pid),
     );
+
+    let pid: u32 = qemu_pid
+        .parse()
+        .map_err(|e| format!("failed to parse QEMU pid '{}': {}", qemu_pid, e))?;
+
+    // Setup cgroups for QEMU guest process to partition container resources
+    if let Err(e) = cgroups::setup_cgroups(fc, ic, pid) {
+        logging::log_message(
+            logging::Level::Error,
+            &format!("Failed to setup cgroups for container {}: {}", fc.containerid, e),
+        );
+        let _ = Command::new("virsh").arg("destroy").arg(&domain_name).output();
+        return Err(e);
+    }
 
     // NOTE(lorenzo): Start a small program which sees if qemu is killed. That is because 
     //                the real parent of qemu is libvirtd, not virsh. So when containerd tries to kill
@@ -164,6 +179,14 @@ pub fn destroyguest(containerid: &str, crundir: &Path) -> Result<(), Box<dyn Err
                 ),
             }
         }
+    }
+
+    // Teardown cgroups before crundir is removed
+    if let Err(e) = cgroups::destroy_cgroups(containerid, crundir) {
+        logging::log_message(
+            logging::Level::Warn,
+            &format!("Could not remove cgroup for container '{}': {}", domain_name, e),
+        );
     }
 
     fs::remove_dir_all(crundir).ok();

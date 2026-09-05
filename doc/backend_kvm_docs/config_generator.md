@@ -52,6 +52,7 @@ flowchart TD
     mem_calc --> sub_cpu["cpu::cpuconf()<br/>Set arch, machine, vCPUs, pinning"]
     sub_cpu --> sub_boot["boot::bootconf()<br/>Set kernel, initrd, cmdline"]
     sub_boot --> sub_net["network::netconf()<br/>Set virtio network interface"]
+    sub_disk --> sub_disk["disk::diskconf()<br/>Add disk image or LVM"]
     sub_net --> add_pty["Add PTY serial & console devices"]
     add_pty --> to_xml["BackendConfig::to_xml()<br/>Assemble final Libvirt Domain XML"]
     to_xml --> write_disk["Write to /run/runPHI/{id}/domain.xml"]
@@ -64,7 +65,7 @@ flowchart TD
    - If `0`, inspects the OCI spec limit: `fc.jsonconfig["linux"]["resources"]["memory"]["limit"]` (converted from bytes to MB).
    - Falls back to built-in defaults: **1024 MB** for Linux guests, **32 MB** for bare-metal/inmate guests.
    - Converts final MB to KiB (`* 1024`) for Libvirt.
-3. **Dispatch Submodules**: Calls `cpu::cpuconf`, `boot::bootconf`, and `network::netconf`.
+3. **Dispatch Submodules**: Calls `cpu::cpuconf`, `boot::bootconf`, `disk::diskconf` and `network::netconf`.
 4. **Append Essential System Devices**:
    - PTY Serial device: `<serial type='pty'><target type='isa-serial' port='0'/></serial>`
    - Primary Console: `<console type='pty'><target type='serial' port='0'/></console>`
@@ -185,9 +186,6 @@ The `disk.rs` module defines storage attachments.
    - Formatted with `mkfs.ext4` and populated with a clone of the container's rootfs.
    - Attached as a raw block device (`<disk type='block' device='disk'>`).
    - Automatically removed at container deletion (`destroyguest`).
-
-> [!NOTE]
-> In current production releases of `backend_kvm`, guests primarily boot using direct kernel + initramfs (`ramdisk`) in RAM. The LVM and file-disk provisioning pipeline is currently undergoing consolidation with the Libvirt Domain XML builder.
 
 ---
 

@@ -82,7 +82,24 @@ For standard Linux guests booting an `Image` kernel and running rootfs from a co
 
 ---
 
-### Template 3: Real-Time Isolated Linux Guest
+### Template 3: File disk
+
+```json
+{
+"os_var": "linux",
+    "inmate": "/boot/Image",
+    "disk_type": "file",
+    "disk_image": "/boot/rootfs.img",
+    "memory": 512,
+    "net": "no"
+}
+```
+
+- Kernel boots with `console=ttyS0,115200 root=/dev/vda rw`.
+
+---
+
+### Template 4: Real-Time Isolated Linux Guest
 
 For safety-critical or low-latency workloads requiring dedicated physical CPU cores and interrupt isolation:
 
@@ -110,7 +127,7 @@ For safety-critical or low-latency workloads requiring dedicated physical CPU co
 
 ---
 
-### Template 4: Linux Guest with Host Bridge Networking
+### Template 5: Linux Guest with Host Bridge Networking
 
 To connect the guest directly to an existing host Linux bridge (e.g. `docker0` or `virbr0`) so that other containers or external network machines can reach it:
 

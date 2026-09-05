@@ -53,6 +53,9 @@ impl BackendConfig {
   <seclabel type='static' model='dac' relabel='no'>
     <label>root:root</label>
   </seclabel>
+  <memoryBacking>
+   <locked\>
+  </memoryBacking>
   <on_poweroff>destroy</on_poweroff>
   <on_reboot>destroy</on_reboot>
   <on_crash>destroy</on_crash>

@@ -14,9 +14,11 @@ crates/backend_kvm/src/
 ├── configGenerator/
 │   ├── boot.rs              # Kernel, initramfs, DTB, and cmdline arguments
 │   ├── cpu.rs               # Architecture, machine type, vCPUs, pinning, and KVM/TCG mode
-│   ├── disk.rs              # Block device / storage configuration
+│   ├── disk.rs              # Block device / storage configuration & LVM provisioning
 │   └── network.rs           # Virtual NIC definitions (SLIRP, Bridge, Libvirt network)
-└── irq.rs                   # Host CPU isolation detection and IRQ affinity steering
+├── cgroups.rs               # Host cgroup isolation & resource limits (libcgroups)
+├── irq.rs                   # Host CPU isolation detection and IRQ affinity steering
+└── timer.rs                 # Zero-overhead TSC monotonic timer
 ```
 
 ### The `BackendConfig` Data Structure
@@ -48,10 +50,10 @@ The entry point is `configGenerator::config_generate(fc: &f2b::FrontendConfig)`.
 ```mermaid
 flowchart TD
     start["config_generate"] --> parse_cfg["Parse /boot/config.json<br/>(f2b::ImageConfig::get_from_file)"]
-    parse_cfg --> mem_calc["Calculate RAM<br/>(config.memory vs OCI limit vs default)"]
-    mem_calc --> sub_cpu["cpu::cpuconf()<br/>Set arch, machine, vCPUs, pinning"]
+    parse_cfg --> mem_calc["Calculate RAM<br/>(config.memory vs OCI cgroup limit vs default)"]
+    mem_calc --> sub_cpu["cpu::cpuconf()<br/>Set arch, machine, vCPUs (OCI quota/period), pinning"]
     sub_cpu --> sub_boot["boot::bootconf()<br/>Set kernel, initrd, cmdline"]
-    sub_boot --> sub_disk["disk::diskconf()<br/>Add disk image or LVM"]
+    sub_boot --> sub_disk["disk::diskconf()<br/>Plan disk image or LVM LV"]
     sub_disk --> sub_net["network::netconf()<br/>Set virtio network interface"]
     sub_net --> add_pty["Add PTY serial & console devices"]
     add_pty --> to_xml["BackendConfig::to_xml()<br/>Assemble final Libvirt Domain XML"]
@@ -90,7 +92,7 @@ The module conditionally compiles rules for `x86_64` and `aarch64`:
 | **With `/dev/kvm` Available** | `domain_type = "kvm"`<br/>`<cpu mode='host-passthrough' check='none'/>` | `domain_type = "kvm"`<br/>`<cpu mode='host-passthrough' check='none'/>` |
 | **Without `/dev/kvm` (Fallback)** | `domain_type = "qemu"`<br/>`<cpu mode='custom'><model>qemu64</model></cpu>` | `domain_type = "qemu"`<br/>`<cpu mode='custom'><model>max</model></cpu>` |
 
-#### vCPU Sizing Hierarchy
+#### vCPU Sizing Hierarchy & OCI cgroups
 
 `cpuconf` derives the number of allocated virtual CPUs through this priority order:
 
@@ -104,27 +106,27 @@ graph TD
     E -->|No cgroups limit| G["Allocate default: 1 vCPU"]
 ```
 
-> **_NOTE:_**
+1. **Explicit `vcpus`**: High-priority override from `/boot/config.json`.
+2. **vCPU Pinning Length**: If `vcpus` is not specified, but `vcpu_pinning` contains mappings, the number of vCPUs matches `vcpu_pinning.len()`.
+3. **OCI cgroups Quota / Period**: If neither is set, runPHI reads `fc.jsonconfig["linux"]["resources"]["cpu"]["quota"]` and `period`. If both are positive, it computes:
+   $$\text{oci\_cpus} = \left\lceil \frac{\text{quota}}{\text{period}} \right\rceil$$
+4. **Default**: Falls back to `1` vCPU.
+
+> [!NOTE]
 > If a user allocates more vCPUs in `/boot/config.json` than the container's OCI cgroup CPU quota allows, runPHI logs an informative warning:
 > `runPHI is allocating X vCPUs, but the container has a limit of Y CPUs (quota: Z)`
 
-#### vCPU Pinning (`<cputune>`)
+#### vCPU Pinning (`<cputune>`) vs. Process cgroups (`cpuset.cpus`)
 
-When `vcpu_pinning` is defined in `/boot/config.json`:
-```json
-"vcpu_pinning": [
-  { "vcpu": 0, "pcpu": 2 },
-  { "vcpu": 1, "pcpu": 3 }
-]
-```
-
-`cpu.rs` generates a `<cputune>` block enforcing static CPU affinity on the host:
-```xml
-<cputune>
-  <vcpupin vcpu='0' cpuset='2'/>
-  <vcpupin vcpu='1' cpuset='3'/>
-</cputune>
-```
+It is important to distinguish between Libvirt `<cputune>` and host cgroups:
+- **Libvirt `<cputune>`**: When `vcpu_pinning` is defined in `/boot/config.json`, Libvirt pins each individual virtual CPU thread to a specific host CPU core:
+  ```xml
+  <cputune>
+    <vcpupin vcpu='0' cpuset='2'/>
+    <vcpupin vcpu='1' cpuset='3'/>
+  </cputune>
+  ```
+- **Host cgroups (`cgroups.rs`)**: When the user specifies `--cpuset-cpus=2,3` on the container engine CLI, `cgroups.rs` writes `2,3` into `/sys/fs/cgroup/runphi/<id>/cpuset.cpus`. This ensures that **the entire QEMU process** (including the main emulator thread and I/O worker threads) is restricted to those cores, preventing auxiliary threads from perturbing other host workloads.
 
 ---
 
@@ -174,18 +176,81 @@ Any other value enables networking.
 
 ### 2.4 Storage & Disk Management (`disk.rs`)
 
-The `disk.rs` module defines storage attachments.
+The `disk.rs` module manages block devices and persistent root filesystems for guests. It supports three strategies defined by the `disk_type` parameter in `/boot/config.json`:
 
-#### Architectural Design
-1. **File-Backed Disk (`disk_type: "file"`)**:
-   - A raw ext4 disk image is bundled inside the container rootfs (e.g. `/boot/rootfs.img`).
-   - Attached as a virtio block device (`<disk type='file' device='disk'>`).
-   - Guest writes land in the container's writable storage layer.
-2. **Host LVM Disk (`disk_type: "lvm"`)**:
-   - A dedicated Logical Volume (`/dev/<vg>/lv_<containerid>`) is created at `create` time.
-   - Formatted with `mkfs.ext4` and populated with a clone of the container's rootfs.
-   - Attached as a raw block device (`<disk type='block' device='disk'>`).
-   - Automatically removed at container deletion (`destroyguest`).
+| Strategy | `disk_type` | Libvirt XML Target | Description |
+|---|---|---|---|
+| **RAM Root** | `""` (default) | None | Guest boots using an initramfs (`ramdisk`) in memory; no block device attached. |
+| **File-Backed** | `"file"` | `<disk type='file' device='disk'>` | Attaches a pre-built raw ext4 image (`disk_image`) bundled inside the container rootfs. |
+| **Host LVM** | `"lvm"` | `<disk type='block' device='disk'>` | Provisions a dedicated host Logical Volume per container, clones the container rootfs into it, and attaches it as a raw block device. |
+
+---
+
+#### Host LVM Storage Subsystem Architecture
+
+When `disk_type: "lvm"` is configured, runPHI dynamically provisions a host Logical Volume so that the container filesystem becomes the virtual machine's persistent root disk (`/dev/vda`).
+
+```mermaid
+flowchart TD
+    subgraph planning["1. Configuration & Planning (diskconf)"]
+        chk_vg["Resolve VG (check /usr/share/runPHI/kvm_lvm_vg or test-vg)"] --> calc_size["Measure rootfs (du -sxm)<br/>Compute size: rootfs * 1.3 + 64 MB"]
+        calc_size --> chk_space["Check free space in VG (vgs)"]
+        chk_space --> write_state["Save LV path & size to /run/runPHI/{id}/disk"]
+        write_state --> gen_xml["Generate Libvirt &lt;disk type='block'&gt; XML"]
+    end
+
+    subgraph provisioning["2. Provisioning (provision_lvm_root)"]
+        lvcreate["lvcreate -y -L {size}M -n lv_{id} {vg}"] --> mkfs["mkfs.ext4 -q -F /dev/{vg}/lv_{id}"]
+        mkfs --> mnt["mount /dev/{vg}/lv_{id} /run/runPHI/{id}/mnt"]
+        mnt --> cproot["cp -a {container_rootfs}/. /run/runPHI/{id}/mnt"]
+        cproot --> umnt["umount /run/runPHI/{id}/mnt"]
+    end
+
+    subgraph teardown["3. Teardown (destroyguest)"]
+        read_disk["Read /run/runPHI/{id}/disk"] --> lvremove["lvremove -y /dev/{vg}/lv_{id}"]
+    end
+
+    planning --> provisioning
+    provisioning --> teardown
+```
+
+#### How `disk.rs` Operates Internally
+
+1. **Volume Group Resolution**:
+   - Reads `/usr/share/runPHI/kvm_lvm_vg`. If this file exists and is not empty, its contents are used as the VG name.
+   - Otherwise, defaults to **`test-vg`** (`DEFAULT_VG`).
+2. **Sizing and Free Space Check**:
+   - Measures the container's uncompressed root filesystem using `du -sxm <mountpoint>`.
+   - If `disk_size` is unset or `0`, applies the default sizing formula:
+     $$\text{size\_mb} = \text{rootfs\_mb} \times \frac{13}{10} + 64$$
+     This provides approximately 30% growth headroom plus a 64 MB floor for filesystem metadata.
+   - Verifies that `size_mb <= vg_free_mb` using `vgs --noheadings --nosuffix --units m -o vg_free <vg>`. If space is insufficient, creation aborts with an error.
+3. **State Tracking**:
+   - Writes the planned device path and size to `/run/runPHI/<id>/disk` (e.g. `/dev/test-vg/lv_cont123 2048`).
+4. **Domain XML Generation**:
+   Generates a virtio block disk definition:
+   ```xml
+   <disk type='block' device='disk'>
+     <driver name='qemu' type='raw'/>
+     <source dev='/dev/test-vg/lv_cont123'/>
+     <target dev='vda' bus='virtio'/>
+   </disk>
+   ```
+5. **Provisioning Pipeline (`provision_lvm_root`)**:
+   During `createguest`, runPHI executes:
+   - `lvcreate -y -L <size_mb>M -n lv_<containerid> <vg>`
+   - `mkfs.ext4 -q -F /dev/<vg>/lv_<containerid>`
+   - `mount /dev/<vg>/lv_<containerid> /run/runPHI/<id>/mnt`
+   - `cp -a <mountpoint>/. /run/runPHI/<id>/mnt`
+   - `umount /run/runPHI/<id>/mnt`
+   If any command in this sequence fails, runPHI performs best-effort rollback (unmounts `/run/runPHI/<id>/mnt` and executes `lvremove -y`), preventing orphaned volumes.
+6. **Kernel Command Line Injection (`boot.rs`)**:
+   When `disk_type` is `"lvm"`, `boot.rs` automatically points root to the virtual block device:
+   ```
+   console=ttyS0,115200 root=/dev/vda rw
+   ```
+7. **Automated Teardown**:
+   During `destroyguest`, runPHI checks `/run/runPHI/<id>/disk` and executes `lvremove -y <lv>`, completely releasing host storage.
 
 ---
 

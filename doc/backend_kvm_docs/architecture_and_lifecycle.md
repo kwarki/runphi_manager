@@ -1,30 +1,24 @@
 # runPHI KVM Backend — Architecture and Lifecycle
 
-This document provides a comprehensive technical breakdown of the **KVM backend** (`backend_kvm`) in runPHI. It explains how runPHI integrates with the Linux Kernel-based Virtual Machine (KVM), Libvirt, and QEMU, details the container lifecycle state machine, explains the process supervision architecture, and describes how to set up the host environment.
+`backend_kvm` enables runPHI to map standard OCI container lifecycle operations (`create`, `start`, `kill`, `delete`, `state`) to virtual machines backed by Linux KVM, Libvirt, and QEMU. This document describes the backend architecture, process management, resource controls (cgroups and IRQ steering), host requirements, and runtime lifecycle.
 
 ---
 
-## 1. Architectural Overview
-
-runPHI acts as an OCI-compliant container runtime that translates standard container lifecycle operations (`create`, `start`, `kill`, `delete`, `state`) into hypervisor operations. While backends like Jailhouse target hardware partitioning and Xen targets Type-1 microkernel virtualization, **`backend_kvm`** targets standard Linux Type-2 virtualization using **KVM** and **Libvirt**.
-
-### Layered Architecture
+## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph caller["Container Engine / Orchestration"]
-        docker["Docker CLI / Engine"]
-        k8s["Kubernetes (Kubelet)"]
-        crio["CRI-O / containerd"]
+    subgraph caller["Container Orchestration"]
+        docker["Docker / containerd / CRI-O"]
     end
 
-    subgraph runphi_bin["runphi Binary (Compiled with --features kvm)"]
+    subgraph runphi_bin["runphi Binary (--features kvm)"]
         direction TB
         oci_entry["OCI CLI Dispatch (liboci_cli)"]
         fwd["Forwarding Logic (forwarding.rs)<br/>Checks /boot/config.json & /run/runPHI/{id}/"]
-        f2b_layer["Frontend-to-Backend Abstraction (f2b)<br/>ImageConfig & FrontendConfig"]
+        f2b_layer["Frontend-to-Backend Layer (f2b)<br/>ImageConfig & FrontendConfig"]
         
-        subgraph backend_kvm["backend_kvm Crate"]
+        subgraph backend_kvm["backend_kvm"]
             direction TB
             cfg_gen["configGenerator<br/>(boot, cpu, network, disk)"]
             domain_xml["Domain XML Builder"]
@@ -32,27 +26,25 @@ flowchart TB
             cgroups_mgr["cgroups Manager (cgroups.rs)<br/>(libcgroups v1/v2 enforcement)"]
             disk_mgr["LVM Disk Provisioner (disk.rs)<br/>(lvcreate, mkfs.ext4, mount)"]
             watcher_mgr["PID Watcher Supervisor"]
-            irq_mgr["IRQ Steering & CPU Isolation (irq.rs)"]
+            irq_mgr["IRQ Steering (irq.rs)"]
             timer_src["TSC TickSource (timer.rs)"]
         end
     end
 
-    subgraph host_stack["Host Virtualization & Kernel Infrastructure"]
+    subgraph host_stack["Host System"]
         libvirt["libvirtd / virtqemud daemon"]
         virsh_cli["virsh CLI utility"]
         qemu["qemu-system-x86_64 / aarch64"]
-        kvm_mod["Linux KVM Kernel Module (/dev/kvm)"]
+        kvm_mod["KVM Kernel Module (/dev/kvm)"]
         cgroup_fs["Host cgroupfs (/sys/fs/cgroup/runphi/<id>)"]
-        host_lvm["Host LVM Subsystem (/dev/<vg>/lv_<id>)"]
+        host_lvm["Host LVM (/dev/<vg>/lv_<id>)"]
         proc_irq["Host IRQ Subsystem (/proc/irq/*/smp_affinity_list)"]
     end
 
     runc["runc_vanilla<br/>(for standard containers)"]
 
     %% Connections
-    docker --> crio
-    k8s --> crio
-    crio -- "exec runc" --> oci_entry
+    docker --> oci_entry
     oci_entry --> fwd
 
     fwd -- "No /boot/config.json" --> runc
@@ -74,18 +66,25 @@ flowchart TB
     disk_mgr --> host_lvm
     irq_mgr --> proc_irq
 ```
+
+### Libvirt Integration
+
+runPHI drives Libvirt via `virsh` rather than spawning raw QEMU processes directly:
+- **Declarative specification**: Libvirt Domain XML separates VM definition from hypervisor CLI flags across `x86_64` and `aarch64`.
+- **Resource resolution**: Libvirt manages bus topologies, PCI bridges, virtio device addresses, and PTY allocations for serial consoles.
+- **TCG fallback**: If hardware virtualization (`/dev/kvm`) is absent, Libvirt transparently falls back to QEMU TCG software emulation without altering the runtime interface.
+- **Lifecycle containment**: Standard domain policies (`on_poweroff=destroy`, `on_reboot=destroy`, `on_crash=destroy`) ensure instances terminate cleanly on guest halt.
+
 ---
 
-## 2. Host Prerequisites & Dependencies
-
-To use runPHI with the KVM backend, the host system must meet the following hardware and software requirements:
+## Host Prerequisites and Setup
 
 ### Hardware Requirements
-- **CPU**: x86_64 with Intel VT-x or AMD-V support, or ARM64 (aarch64) with ARM Virtualization Extensions (EL2).
-- **Virtualization Device**: `/dev/kvm` must exist and be accessible. (If absent, runPHI can run under QEMU TCG emulation, though performance will be degraded).
+- **CPU**: x86_64 with Intel VT-x or AMD-V, or ARM64 (aarch64) with ARM Virtualization Extensions (EL2).
+- **Virtualization Device**: `/dev/kvm` must exist and be accessible.
 
 ### Software Dependencies
-Install the required tools and libraries on the host:
+Install the required virtualization and storage utilities:
 
 #### Ubuntu / Debian:
 ```bash
@@ -112,96 +111,75 @@ sudo dnf install -y qemu-kvm libvirt libvirt-client procps-ng lvm2 e2fsprogs bri
 ```
 
 ### Service Verification
-Ensure the Libvirt daemon is enabled and running:
+Enable and start the Libvirt daemon:
 ```bash
-# For traditional monolithic libvirtd:
 sudo systemctl enable --now libvirtd
 
 # Verify virsh connectivity:
 virsh uri
-# Output should look like: qemu:///system
+# Output should return: qemu:///system
 ```
 
-Verify that the current user / container daemon has access to the libvirt socket and KVM:
+Verify KVM permissions:
 ```bash
 ls -l /dev/kvm
 # crw-rw----+ 1 root kvm 10, 232 ... /dev/kvm
 ```
 
-### Host LVM Storage Prerequisites
+### LVM Storage Setup
 
-When running guests with persistent block storage using LVM (`disk_type: "lvm"` in `/boot/config.json`), runPHI provisions a dedicated host Logical Volume per container (`/dev/<vg>/lv_<containerid>`), formats it with `mkfs.ext4`, and populates it with a clone of the container rootfs.
+When running guests with persistent block storage using LVM (`disk_type: "lvm"` in `/boot/config.json`), runPHI provisions a dedicated host Logical Volume per container (`/dev/<vg>/lv_<containerid>`), formats it with `mkfs.ext4`, and copies the container rootfs into it.
 
-Before runPHI can create these logical volumes, the host must have an active **Volume Group (VG)**:
+The host must have an active Volume Group before launching LVM containers.
 
-1. **Default Volume Group Name**:
-   By default, `backend_kvm` searches for a volume group named **`test-vg`**.
+By default, runPHI looks for a Volume Group named `test-vg`. To use a different name, configure the override file:
+```bash
+sudo mkdir -p /usr/share/runPHI
+echo "my_vg" | sudo tee /usr/share/runPHI/kvm_lvm_vg
+```
 
-2. **Option A: Setting Up a Dedicated Disk or Partition**:
-   If you have an unformatted partition or dedicated disk (e.g. `/dev/sdb` or `/dev/nvme1n1p1`):
-   ```bash
-   # Initialize physical volume
-   sudo pvcreate /dev/sdb
+#### Option A: Using a Dedicated Disk or Partition
+```bash
+# Initialize the physical volume
+sudo pvcreate /dev/sdb
 
-   # Create the default volume group
-   sudo vgcreate test-vg /dev/sdb
-   ```
+# Create the volume group
+sudo vgcreate test-vg /dev/sdb
+```
 
-3. **Option B: Setting Up a Loopback-Backed Volume Group (Development / Testing)**:
-   If no dedicated block device is available, create a sparse file and attach it as a loop device:
-   ```bash
-   # 1. Create a 10 GB backing file
-   sudo truncate -s 10G /var/lib/runphi-lvm.img
+#### Option B: Using a Loopback File (Testing / Development)
+```bash
+# Create a 10 GB backing file
+sudo truncate -s 10G /var/lib/runphi-lvm.img
 
-   # 2. Attach backing file to the next available loop device
-   sudo losetup -fP /var/lib/runphi-lvm.img
+# Attach to an available loop device
+sudo losetup -fP /var/lib/runphi-lvm.img
+LOOPDEV=$(losetup -j /var/lib/runphi-lvm.img | cut -d: -f1)
 
-   # 3. Find the assigned loop device name (e.g. /dev/loop0)
-   LOOPDEV=$(losetup -j /var/lib/runphi-lvm.img | cut -d: -f1)
+# Initialize PV and create the VG
+sudo pvcreate "$LOOPDEV"
+sudo vgcreate test-vg "$LOOPDEV"
+```
 
-   # 4. Initialize physical volume and create the volume group
-   sudo pvcreate "$LOOPDEV"
-   sudo vgcreate test-vg "$LOOPDEV"
-   ```
-
-4. **Custom Volume Group Override**:
-   If your host uses a different volume group name (e.g. `vg_guests` or `rhel_root`):
-   ```bash
-   sudo mkdir -p /usr/share/runPHI
-   echo "vg_guests" | sudo tee /usr/share/runPHI/kvm_lvm_vg
-   ```
-   `backend_kvm` reads `/usr/share/runPHI/kvm_lvm_vg` dynamically on each container creation.
-
-5. **Verify Free Storage**:
-   Verify that the volume group exists and has sufficient free space:
-   ```bash
-   sudo vgs
-   # Output:
-   # VG      #PV #LV #SN Attr   VSize   VFree
-   # test-vg   1   0   0 wz--n- <10.00g <10.00g
-   ```
+Verify available capacity:
+```bash
+sudo vgs
+```
 
 ---
 
-## 3. Building and Installing runPHI with the KVM Backend
-
-runPHI selects its hypervisor backend at build time through Cargo features. Exactly one backend (`jailhouse`, `xen`, or `kvm`) must be enabled.
+## Building and Installation
 
 ### Native Build (x86_64)
 
-Build directly on the host machine:
-
 ```bash
 cd rust_runphi
-
-# Build the release binary with kvm feature enabled
 cargo build --release -p runphi --no-default-features --features kvm
 ```
 
-The compiled binary will be located at:
-`rust_runphi/target/release/runphi`
+The compiled binary will be placed at `rust_runphi/target/release/runphi`.
 
-Verify the active backend:
+Check the compiled backend:
 ```bash
 ./target/release/runphi --version
 # Output: runphi 0.5.8 (backend: kvm)
@@ -209,53 +187,45 @@ Verify the active backend:
 
 ### Cross-Compilation for ARM64 (aarch64)
 
-Use the built-in `compile_rust.sh` script:
 ```bash
 cd rust_runphi
 ./compile_rust.sh kvm
 ```
-This builds for `--target aarch64-unknown-linux-gnu` with the `kvm` feature.
 
 ### System Installation
 
-1. Copy the runPHI binary to the system binaries directory:
-   ```bash
-   sudo install -m 0755 rust_runphi/target/release/runphi /usr/local/sbin/runphi
-   ```
+```bash
+# Copy binary
+sudo install -m 0755 rust_runphi/target/release/runphi /usr/local/sbin/runphi
 
-2. Create the runPHI shared directories:
-   ```bash
-   sudo mkdir -p /usr/share/runPHI
-   sudo mkdir -p /run/runPHI
-   ```
+# Create shared state directories
+sudo mkdir -p /usr/share/runPHI /run/runPHI
 
-3. Preserve vanilla runc for non-partitioned containers:
-   ```bash
-   # Backup original runc if replacing /usr/bin/runc, or reference /usr/local/sbin/runc_vanilla
-   sudo cp -n "$(command -v runc)" /usr/local/sbin/runc_vanilla
-   ```
+# Preserve original runc for non-partitioned containers
+sudo cp -n "$(command -v runc)" /usr/local/sbin/runc_vanilla
+```
 
-4. Configure Docker (Optional — to use runPHI as an alternative runtime without replacing system runc):
-   Add the following to `/etc/docker/daemon.json`:
-   ```json
-   {
-     "runtimes": {
-       "runphi": {
-         "path": "/usr/local/sbin/runphi"
-       }
-     }
-   }
-   ```
-   Then reload Docker:
-   ```bash
-   sudo systemctl restart docker
-   ```
+#### Docker Configuration (Optional)
+To register runPHI as a Docker runtime without replacing system runc, add this to `/etc/docker/daemon.json`:
+```json
+{
+  "runtimes": {
+    "runphi": {
+      "path": "/usr/local/sbin/runphi"
+    }
+  }
+}
+```
+Then restart Docker:
+```bash
+sudo systemctl restart docker
+```
 
 ---
 
-## 4. Lifecycle of a KVM-Partitioned Container
+## Container Lifecycle
 
-When a container engine executes an OCI command against runPHI, `runphi/src/main.rs` dispatches the call through the backend API.
+When a container engine invokes runPHI, `runphi/src/main.rs` dispatches the command through the backend interface:
 
 ```mermaid
 sequenceDiagram
@@ -315,59 +285,53 @@ sequenceDiagram
     Main-->>Engine: Container deleted
 ```
 
-### Detailed Lifecycle Operations
+### Lifecycle Operations
 
 #### 1. `create` (`createguest`)
-- **Domain Generation**: Invokes `configGenerator::config_generate` to build `/run/runPHI/<id>/domain.xml`. If `disk_type == "lvm"`, writes `/run/runPHI/<id>/disk` with the planned LV path and size.
-- **LVM Storage Provisioning**: If `/run/runPHI/<id>/disk` exists, `provision_lvm_root` invokes `lvcreate` to allocate `/dev/<vg>/lv_<id>`, formats it with `mkfs.ext4`, mounts it under `/run/runPHI/<id>/mnt`, copies the entire container rootfs into the volume via `cp -a`, and unmounts it. If any command fails, `provision_lvm_root` performs best-effort cleanup (`lvremove`) and returns an error.
-- **Domain Launch**: Runs `virsh create /run/runPHI/<id>/domain.xml --paused`. This provisions the QEMU process in a paused state.
-- **PID Discovery**: Locates the spawned QEMU PID via `pgrep -f "qemu-system.*runphi-<id>"`.
-- **cgroups Setup**: Calls `cgroups::setup_cgroups(fc, ic, pid)`. The QEMU main PID is added to the container cgroup, and resource limits (CPU quota/period, memory limit, cpuset) are applied via `libcgroups`. If cgroup setup fails, runPHI immediately calls `virsh destroy runphi-<id>` to tear down the domain before returning the error.
-- **Watcher Supervision**: Spawns the supervisor watcher shell loop monitoring `/proc/<qemu_pid>` and writes its PID to `fc.pidfile`.
-- **IRQ Steering**: Evaluates whether `steer_irq` is configured. If so, saves original host IRQ affinities to `saved_irq_affinities.json` and updates `/proc/irq/*/smp_affinity_list`.
-- **State Storage**: Calls `storeinfo` to persist `bundle`, `pidfile`, and `OS`.
+- **Domain generation**: Calls `configGenerator::config_generate` to write `/run/runPHI/<id>/domain.xml`. If `disk_type == "lvm"`, writes `/run/runPHI/<id>/disk` with the target LV path and size.
+- **LVM provisioning**: If `/run/runPHI/<id>/disk` exists, `provision_lvm_root` allocates `/dev/<vg>/lv_<id>` via `lvcreate`, formats it with `mkfs.ext4`, mounts it at `/run/runPHI/<id>/mnt`, copies the rootfs via `cp -a`, and unmounts. If any step fails, rollback unmounts and removes the LV.
+- **Domain spawn**: Runs `virsh create /run/runPHI/<id>/domain.xml --paused`, provisioning QEMU in a paused state.
+- **PID discovery**: Finds the QEMU PID via `pgrep -f "qemu-system.*runphi-<id>"`.
+- **cgroups setup**: Calls `cgroups::setup_cgroups(fc, ic, pid)`. Attaches the QEMU PID and applies OCI CPU/memory limits. If setup fails, runPHI immediately runs `virsh destroy` to prevent unconfined VM execution.
+- **Watcher supervision**: Starts the supervisor watcher monitoring `/proc/<qemu_pid>` and writes its PID to `fc.pidfile`.
+- **IRQ steering**: If `steer_irq` is configured, backs up host affinities and updates `/proc/irq/*/smp_affinity_list`.
+- **State recording**: Writes `bundle`, `pidfile`, and `OS` to `/run/runPHI/<id>/`.
 
 #### 2. `start` (`startguest`)
-- Invokes `virsh resume runphi-<containerid>`.
-- The domain transitions from paused to running.
+- Runs `virsh resume runphi-<containerid>`. The domain transitions from paused to running.
 
 #### 3. `kill` / `stop` (`stopguest`)
-- Invokes `virsh suspend runphi-<containerid>`.
-- The vCPUs are paused by the hypervisor.
+- Runs `virsh suspend runphi-<containerid>`. Hypervisor pauses all vCPUs.
 
 #### 4. `delete` (`destroyguest` & `cleanup`)
-- **IRQ Restoration**: Calls `irq::restore_irq_steering`, rolling back any modified interrupt affinities using `/run/runPHI/<id>/saved_irq_affinities.json`.
-- **Domain Teardown**: Runs `virsh destroy runphi-<containerid>`. If the guest has already shut down cleanly (e.g. from an internal `poweroff`), errors like `"domain is not running"` are logged and ignored.
-- **LVM Teardown**: If `/run/runPHI/<id>/disk` exists, reads the allocated LV path and executes `lvremove -y <lv>`, ensuring no orphaned block devices remain on the host.
-- **cgroups Teardown**: Calls `cgroups::destroy_cgroups(containerid, crundir)` to delete the host cgroup directory via `libcgroups`.
-- **State Deletion**: Removes `/run/runPHI/<id>/`.
+- **IRQ restoration**: Restores saved host interrupt affinities from `saved_irq_affinities.json`.
+- **Domain teardown**: Runs `virsh destroy runphi-<containerid>`. If the domain already powered off internally, the error is logged and ignored.
+- **LVM removal**: If `/run/runPHI/<id>/disk` exists, runs `lvremove -y <lv>`.
+- **cgroups cleanup**: Calls `cgroups::destroy_cgroups` to remove the cgroup directory.
+- **State cleanup**: Removes `/run/runPHI/<id>/`.
 
 ---
 
-## 5. The Watcher Process Mechanism
+## Process Supervision (The Watcher)
 
-### The Problem
-In standard container runtimes, the OCI runtime (`runc`) creates the container process directly as its own child. The runtime writes the PID of this child into the OCI `--pid-file`. When the child terminates, the container manager (containerd or dockerd) receives a `SIGCHLD` signal and transitions the container state to `Stopped`.
+In standard OCI runtimes (`runc`), the runtime creates the container process directly as a child and writes its PID into `--pid-file`. containerd monitors that PID for exit (`SIGCHLD`).
 
-In the KVM backend, **the QEMU process is a child of `libvirtd`**, not runPHI or containerd:
+In `backend_kvm`, **QEMU is spawned by `libvirtd`**, not runPHI:
 ```
 systemd
  ├── containerd
  └── libvirtd
       └── qemu-system-x86_64 (Domain runphi-<id>)
 ```
-If runPHI wrote the raw QEMU PID into `--pid-file`, containerd would fail to track its lifecycle because containerd is not the parent of QEMU. containerd would never receive `SIGCHLD` when QEMU exits, leaving the container permanently stuck in status `"Up"`. Furthermore, standard termination signals sent to `--pid-file` would not integrate cleanly with Libvirt's management.
 
-### The Solution: The Supervisor Watcher
-During `createguest`, runPHI spawns a minimal watcher process:
+If runPHI wrote QEMU's PID into `--pid-file`, containerd could not supervise it because containerd is not its parent. containerd would never receive `SIGCHLD` upon QEMU exit, leaving the container stuck in status `Up`.
+
+To fix this, `createguest` spawns a minimal supervisor watcher shell process:
 
 ```rust
 let watcher = Command::new("sh")
     .arg("-c")
-    .arg(format!(
-        "while [ -d /proc/{} ]; do sleep 0.2; done",
-        qemu_pid
-    ))
+    .arg(format!("while [ -d /proc/{} ]; do sleep 0.2; done", qemu_pid))
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null())
@@ -377,136 +341,90 @@ let watcher_pid = watcher.id().to_string();
 fs::write(&fc.pidfile, watcher_pid)?;
 ```
 
-1. runPHI finds the QEMU PID via `pgrep -f "qemu-system.*runphi-<containerid>"`.
-2. It launches an independent shell loop monitoring `/proc/<qemu_pid>`.
-3. It records the **watcher's PID** in the container's OCI `pidfile`.
-4. containerd supervises this watcher process as the container's primary process.
-5. When `virsh destroy` terminates QEMU (or the guest powers off), `/proc/<qemu_pid>` disappears.
-6. The watcher loop breaks and the watcher terminates.
-7. containerd receives `SIGCHLD` immediately and updates the container's status to stopped.
+1. runPHI discovers the QEMU PID via `pgrep`.
+2. It spawns the watcher loop tracking `/proc/<qemu_pid>`.
+3. It writes the **watcher's PID** to the container's OCI `pidfile`.
+4. containerd supervises the watcher.
+5. When QEMU exits (via internal poweroff or `virsh destroy`), `/proc/<qemu_pid>` disappears.
+6. The watcher loop terminates, sending `SIGCHLD` to containerd, which marks the container as stopped.
 
 ---
 
-## 6. Resource Partitioning & Sandboxing with cgroups (`cgroups.rs`)
+## cgroups and Resource Sandboxing (`cgroups.rs`)
 
-While Libvirt pins guest virtual CPUs to specific physical host cores using `<cputune>`, QEMU itself runs as a standard host user process. Confining this hypervisor process under host control groups (**cgroups**) is crucial for production multi-tenant and real-time environments.
+Libvirt's `<cputune>` pins vCPU threads to physical CPUs, but QEMU itself is a standard host user process with auxiliary threads: the main emulator event loop, memory allocators, and asynchronous I/O workers. Without host cgroups, these non-vCPU threads roam across all host cores—including real-time cores isolated for other workloads. Furthermore, QEMU host memory consumption is unbounded without cgroups.
 
-The `backend_kvm` crate implements dedicated cgroups management in `crates/backend_kvm/src/cgroups.rs` using the [`libcgroups`](https://crates.io/crates/libcgroups) (v0.7.0) library.
+`backend_kvm` manages cgroups via `crates/backend_kvm/src/cgroups.rs` using the [`libcgroups`](https://crates.io/crates/libcgroups) crate.
 
-### Why cgroups Are Essential for KVM Containers
-
-1. **Auxiliary Thread Confinement**: A running QEMU domain contains multiple threads beyond vCPU workers: the main emulator event loop, memory management threads, and asynchronous block/network I/O workers. Without host cgroups, these non-vCPU threads roam across all host cores (including real-time cores isolated for other workloads), causing severe latency spikes (jitter).
-2. **Host Memory Sandboxing**: Libvirt does not restrict the host memory consumed by QEMU's internal allocations, page tables, and DMA buffers. Enforcing host memory cgroups prevents a guest from exhausting host RAM.
-3. **OCI Parity**: Passing resource flags like `--cpuset-cpus`, `--memory`, or `--cpu-quota` to `docker run` ensures that the QEMU process obeys the exact same resource constraints as standard Linux containers (`runc`).
-
-### How `cgroups.rs` Works
-
-```mermaid
-flowchart TD
-    subgraph create["createguest Pipeline"]
-        pgrep["pgrep finds QEMU PID"] --> resolve["resolve_cgroup_path()<br/>(OCI cgroupsPath or runphi/{id})"]
-        resolve --> save_state["Save cgroup_path & systemd_cgroup<br/>in /run/runPHI/{id}/"]
-        save_state --> init_mgr["create_cgroup_manager()<br/>(cgroups v1/v2, cgroupfs/systemd)"]
-        init_mgr --> attach["manager.add_task(qemu_pid)<br/>(Attaches main PID; child threads inherit)"]
-        attach --> res["build_linux_resources()<br/>(OCI resources + ic.memory fallback)"]
-        res --> apply["manager.apply(&controller_opt)<br/>(Applies memory, cpuset, cpu quota, OOM score)"]
-        apply -->|Success| proceed["Proceed with Watcher & IRQ Steering"]
-        apply -->|Failure| abort["virsh destroy & abort create"]
-    end
-
-    subgraph destroy["destroyguest Pipeline"]
-        read_state["Read /run/runPHI/{id}/cgroup_path"] --> del_mgr["create_cgroup_manager()"]
-        del_mgr --> remove["manager.remove()<br/>(Deletes /sys/fs/cgroup/runphi/{id})"]
-    end
-```
-
-### Key Implementation Mechanisms
+### Implementation Details
 
 #### 1. Path Resolution (`resolve_cgroup_path`)
-The cgroup destination path is resolved from the OCI configuration:
-- If `fc.jsonconfig["linux"]["cgroupsPath"]` is specified, runPHI strips leading slashes (e.g. `/system.slice/runphi-cont.scope` becomes `system.slice/runphi-cont.scope`) and uses it.
-- If omitted or empty, runPHI defaults to `runphi/<container_id>`, creating `/sys/fs/cgroup/runphi/<container_id>` under cgroups v2.
+- Inspects `fc.jsonconfig["linux"]["cgroupsPath"]`. If specified, strips leading slashes (e.g. `/system.slice/runphi-cont.scope` becomes `system.slice/runphi-cont.scope`).
+- If omitted or empty, defaults to `runphi/<container_id>` (resolved under `/sys/fs/cgroup/runphi/<container_id>` on cgroups v2).
 
-#### 2. Driver and Hierarchy Abstraction
-Using `libcgroups`, `cgroups.rs` automatically detects the host hierarchy:
-- **cgroups v2 (Unified Hierarchy)**: Standard on modern distributions (Arch Linux, Fedora, Ubuntu 22.04+).
-- **cgroups v1 (Legacy Hierarchies)**: Supported on older systems or kernels booted with `systemd.unified_cgroup_hierarchy=0`.
-- **Driver**: Inspects `fc.jsonconfig["systemd_cgroup"]` to use either the systemd D-Bus interface or direct cgroupfs manipulation.
+#### 2. Hierarchy and Driver Support
+`libcgroups` auto-detects the host setup:
+- **cgroups v2 (Unified Hierarchy)**: Standard on modern distributions.
+- **cgroups v1 (Legacy Hierarchies)**: Supported on older kernels or when booted with `systemd.unified_cgroup_hierarchy=0`.
+- **Driver**: Inspects `fc.jsonconfig["systemd_cgroup"]` to toggle between systemd D-Bus management and direct cgroupfs manipulation.
 
-The resolved path and driver flag are saved to `/run/runPHI/<id>/cgroup_path` and `/run/runPHI/<id>/systemd_cgroup`.
+The path and driver preference are saved in `/run/runPHI/<id>/cgroup_path` and `/run/runPHI/<id>/systemd_cgroup`.
 
 #### 3. Task Attachment
 ```rust
 let nix_pid = Pid::from_raw(pid as i32);
 manager.add_task(nix_pid)?;
 ```
-Adding the QEMU main PID moves the entire process into the cgroup. Under the Linux kernel task hierarchy, all existing worker threads and any subsequently spawned threads (such as vCPU threads and I/O event loops) automatically inherit this cgroup confinement.
+Adding the QEMU main PID automatically confines all current and subsequently spawned child threads (vCPUs, I/O dispatchers) to the same cgroup.
 
-#### 4. Resource Formulation & Fallbacks (`build_linux_resources`)
-`build_linux_resources` parses OCI resource constraints from `fc.jsonconfig["linux"]["resources"]`:
+#### 4. Resource Constraints & Fallback (`build_linux_resources`)
+`build_linux_resources` extracts OCI resource limits from `fc.jsonconfig["linux"]["resources"]`:
 - **CPU Quota and Period**: Configured via Docker `--cpu-quota` and `--cpu-period`.
-- **CPU Set (`cpuset.cpus`)**: Configured via Docker `--cpuset-cpus` (e.g. `--cpuset-cpus=2,3`).
+- **CPU Affinity (`cpuset.cpus`)**: Configured via Docker `--cpuset-cpus` (e.g. `--cpuset-cpus=2,3`).
 - **Memory Limit**: Deserialized from `resources.memory.limit`.
-- **Fallback Memory Limit**: If `resources.memory` is unset in the OCI spec, but `/boot/config.json` specifies `ic.memory > 0`, runPHI builds a `LinuxMemoryBuilder` limit and applies it to the cgroup:
-  ```rust
-  if ic.memory > 0 && resources.memory().is_none() {
-      let mem = LinuxMemoryBuilder::default()
-          .limit((ic.memory * 1024 * 1024) as i64)
-          .build()?;
-      resources.set_memory(Some(mem));
-  }
-  ```
-- **OOM Score Adjustment**: `fc.jsonconfig["process"]["oomScoreAdj"]` is applied to `ControllerOpt` to configure kernel out-of-memory killing priority.
+- **Memory Fallback**: If `resources.memory` is unset in the OCI spec, but `/boot/config.json` sets `ic.memory > 0`, runPHI builds a `LinuxMemoryBuilder` limit for `ic.memory * 1024 * 1024` bytes and applies it to the cgroup.
+- **OOM Score**: Applies `fc.jsonconfig["process"]["oomScoreAdj"]`.
 
-#### 5. Failure Handling
-If `manager.apply()` fails during `setup_cgroups`, runPHI immediately invokes `virsh destroy runphi-<id>` to eliminate the unconfined virtual machine before propagating the error back to the container engine.
+#### 5. Failure Policy
+If `manager.apply()` fails during `setup_cgroups`, runPHI immediately invokes `virsh destroy runphi-<id>` to terminate the unconfined VM before returning an error to the container engine.
 
-#### 6. Freezing, Telemetry, and Teardown
-- **Freeze / Resume**: `freeze_cgroups(containerid, crundir, freeze)` toggles `FreezerState::Frozen` / `FreezerState::Thawed`, enabling OCI `pause`/`resume` semantics for KVM guests.
-- **Resource Telemetry**: `get_cgroup_stats(containerid, crundir)` queries `manager.stats()` to extract CPU, memory, and blkio accounting statistics for monitoring tools.
-- **Teardown**: During `destroyguest`, `destroy_cgroups` loads the saved state files and invokes `manager.remove()`, unlinking the cgroup directory.
+#### 6. Teardown
+During `destroyguest`, `destroy_cgroups` re-reads the stored cgroup path and driver, calling `manager.remove()` to unlink the cgroup directory.
 
 ---
 
-## 7. Real-Time Isolation & Interrupt Steering (`irq.rs`)
+## Real-Time Isolation & Interrupt Steering (`irq.rs`)
 
-When running real-time or safety-critical tasks in a partitioned container, non-real-time host interrupts (such as network cards, disk controllers, and USB devices) can interrupt the isolated CPU cores and introduce latency spikes (jitter).
+Host hardware interrupts (network adapters, NVMe controllers, USB) targeting real-time cores introduce unpredictable scheduling jitter. `crates/backend_kvm/src/irq.rs` dynamically redirects host interrupts away from real-time cores during container execution.
 
-The `backend_kvm` crate includes an automated **IRQ steering** subsystem in `crates/backend_kvm/src/irq.rs`.
-
-### How It Works
+### Mechanism
 
 1. **Host Isolation Discovery**:
-   The module inspects the host kernel's isolated core lists:
-   - `/sys/devices/system/cpu/isolated` (Linux `isolcpus` boot parameter)
-   - `/sys/devices/system/cpu/nohz_full` (Full tickless real-time cores)
-   - Merges these with any container-specific `isolcpu` and `nohz_full` definitions in `/boot/config.json`.
+   Reads `/sys/devices/system/cpu/isolated` (`isolcpus`) and `/sys/devices/system/cpu/nohz_full`, merging them with `isolcpu` and `nohz_full` from `/boot/config.json`.
 
-2. **Steering Target Validation**:
-   When `steer_irq` (or `irq_steering`) is defined in `/boot/config.json`:
+2. **Target Validation**:
+   When `steer_irq` is configured:
    ```json
    {
      "steer_irq": [0, 1]
    }
    ```
-   The module verifies that none of the target CPUs (`[0, 1]`) are in the isolated core list. If an isolated core is specified as a target, runPHI logs a warning to prevent accidental latency degradation.
+   runPHI verifies that none of the target CPUs (`[0, 1]`) are in the isolated core list. If an isolated core is specified as a target, runPHI logs a warning.
 
-3. **Dynamic Affinity Reconfiguration**:
-   For every hardware interrupt exposed under `/proc/irq/<num>/smp_affinity_list`:
-   - It reads the current affinity and saves it in `/run/runPHI/<id>/saved_irq_affinities.json`.
-   - It writes the target CPU list (e.g. `"0,1"`) to `/proc/irq/<num>/smp_affinity_list`.
-   - Architecture-fixed interrupts (such as timer IRQ 0) that cannot be redirected are skipped gracefully.
+3. **Dynamic Reconfiguration**:
+   For every entry under `/proc/irq/<num>/smp_affinity_list`:
+   - Saves the current affinity to `/run/runPHI/<id>/saved_irq_affinities.json`.
+   - Writes the target CPU list (e.g. `"0,1"`) to `/proc/irq/<num>/smp_affinity_list`.
+   - Architecture-fixed interrupts (e.g. timer IRQ 0) are skipped gracefully.
 
 4. **Rollback on Teardown**:
-   When `destroyguest` is invoked, `irq::restore_irq_steering` reads `saved_irq_affinities.json` and restores all original CPU affinities across the host, ensuring no permanent host contamination.
+   When `destroyguest` runs, `irq::restore_irq_steering` restores all original affinities from `saved_irq_affinities.json`.
 
 ---
 
-## 8. Performance Instrumentation & Timer (`timer.rs`)
+## Monotonic Timer (`timer.rs`)
 
-runPHI features a zero-overhead monotonic timer used for measuring runtime execution phases and boot timing.
-
-Under `backend_kvm`, `src/timer.rs` implements the `TickSource` trait using the x86 Time Stamp Counter (TSC):
+`src/timer.rs` implements runPHI's `TickSource` trait using the x86 Time Stamp Counter (TSC):
 
 ```rust
 #[inline(always)]
@@ -533,29 +451,24 @@ fn read_ticks(&self) -> u64 {
 }
 ```
 
-- **Serializing Instruction (`lfence`)**: Prevents out-of-order execution from reading the counter prematurely.
-- **Graceful Fallback**: On non-x86 architectures or systems where TSC access is restricted, `install()` logs a warning and returns `0` without blocking container execution.
+The `lfence` instruction serializes execution to prevent out-of-order counter reads. On non-x86 targets, `install()` logs a warning and returns `0`.
 
 ---
 
-## 9. On-Disk State Reference
+## On-Disk State
 
-During container execution, `backend_kvm` maintains state files under `/run/runPHI/<containerid>/`:
+State files created under `/run/runPHI/<containerid>/` during container runtime:
 
 | File Path | Description |
 |---|---|
 | `/run/runPHI/<id>/domain.xml` | Generated Libvirt Domain XML definition. |
-| `/run/runPHI/<id>/bundle` | Absolute path to the container OCI bundle directory. |
+| `/run/runPHI/<id>/bundle` | Path to the container OCI bundle directory. |
 | `/run/runPHI/<id>/pidfile` | Path to the OCI pidfile containing the watcher PID. |
-| `/run/runPHI/<id>/OS` | Stores the guest OS classification (e.g. `linux`, `zephyr`). |
-| `/run/runPHI/<id>/cgroup_path` | Stored relative path to the container's cgroup directory. |
-| `/run/runPHI/<id>/systemd_cgroup` | Flag indicating whether the systemd cgroup driver is active (`1` or `0`). |
-| `/run/runPHI/<id>/disk` | State file containing the planned LVM volume path and size (e.g. `/dev/test-vg/lv_<id> 2048`). |
-| `/run/runPHI/<id>/mnt/` | Temporary mount point directory used during rootfs cloning to LVM. |
-| `/run/runPHI/<id>/saved_irq_affinities.json` | JSON mapping of original host IRQ affinities before steering was applied. |
-| `/usr/share/runPHI/kvm_lvm_vg` | Optional host-wide configuration file overriding the default LVM volume group name (`test-vg`). |
+| `/run/runPHI/<id>/OS` | Guest OS classification (`linux`, `zephyr`). |
+| `/run/runPHI/<id>/cgroup_path` | Saved relative path to the container's cgroup directory. |
+| `/run/runPHI/<id>/systemd_cgroup` | Driver flag (`1` for systemd, `0` for cgroupfs). |
+| `/run/runPHI/<id>/disk` | State file containing the planned LVM volume path and size (`<lv_path> <size_mb>`). |
+| `/run/runPHI/<id>/mnt/` | Temporary mount point used while copying the rootfs to the LVM volume. |
+| `/run/runPHI/<id>/saved_irq_affinities.json` | Host IRQ affinities before steering was applied. |
+| `/usr/share/runPHI/kvm_lvm_vg` | Host configuration file overriding the default LVM volume group name (`test-vg`). |
 | `/usr/share/runPHI/log.txt` | Global runPHI execution log. |
-
----
-
-Proceed to **[Config Generator Modules Deep Dive](config_generator.md)** to examine how the Domain XML is generated in detail.
